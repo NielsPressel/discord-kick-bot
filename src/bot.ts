@@ -2,26 +2,132 @@ import Discord from 'discord.js';
 import config from '../config.json';
 
 import admin from 'firebase-admin';
-import { Watcher } from './watcher';
-import { FirebaseSync } from './guild_firebase_sync';
+import { EventHandler } from './event_handler';
 
 interface BotData {
     activeConnections: Map<string, Discord.VoiceConnection>;
-    firebaseUserId?: string;
+    userWatchMap: Map<string, Discord.GuildMember[]>;
+    client?: Discord.Client;
+}
+
+export namespace FirebaseHandler {
+    const userCollection = 'watchedUsers';
+    const listeners = new Map<string, Function>();
+
+    export function addUserToWatchList(userId: string, guildId: string) {
+        admin.firestore().collection(userCollection).doc(userId).set({
+            guildId,
+        });
+    }
+
+    export function removeUserFromWatchList(userId: string) {
+        admin.firestore().collection(userCollection).doc(userId).delete();
+    }
+
+    export async function addGuildListener(
+        guildId: string,
+        callback: (members: Discord.GuildMember[]) => void
+    ) {
+        const guild = await BotDataStorage.getClient()!.guilds.fetch(guildId);
+        const func = admin
+            .firestore()
+            .collection(userCollection)
+            .where('guildId', '==', guildId)
+            .onSnapshot(async (documents) => {
+                const members: Discord.GuildMember[] = [];
+
+                for (let i = 0; i < documents.size; i++) {
+                    var user = await guild.members.fetch(documents.docs[i].id);
+                    members.push(user);
+                }
+
+                callback(members);
+                BotDataStorage.setGuildWatchList(guildId, members);
+            });
+
+        listeners.set(guildId, func);
+    }
+
+    export function removeGuildListener(guildId: string) {
+        listeners.get(guildId)!();
+        listeners.delete(guildId);
+        BotDataStorage.removeGuildWatchList(guildId);
+    }
+
+    export async function getGuildWatchList(guildId: string) {
+        const snapshot = await admin
+            .firestore()
+            .collection(userCollection)
+            .where('guildId', '==', guildId)
+            .get();
+
+        const members: Discord.GuildMember[] = [];
+        const guild = await BotDataStorage.getClient()!.guilds.fetch(guildId);
+
+        for (let i = 0; i < snapshot.size; i++) {
+            if (snapshot.docs[i].exists) {
+                members.push(await guild.members.fetch(snapshot.docs[i].id));
+            }
+        }
+
+        return members;
+    }
+}
+
+export namespace BotDataStorage {
+    const botData: BotData = {
+        activeConnections: new Map(),
+        userWatchMap: new Map(),
+    };
+
+    export function addConnection(
+        guildId: string,
+        connection: Discord.VoiceConnection
+    ) {
+        botData.activeConnections.set(guildId, connection);
+    }
+
+    export function getConnection(guildId: string) {
+        return botData.activeConnections.get(guildId);
+    }
+
+    export function removeConnection(guildId: string) {
+        getConnection(guildId)?.disconnect();
+        botData.activeConnections.delete(guildId);
+    }
+
+    export function setClient(client: Discord.Client) {
+        botData.client = client;
+    }
+
+    export function getClient() {
+        return botData.client;
+    }
+
+    export function setGuildWatchList(
+        guildId: string,
+        members: Discord.GuildMember[]
+    ) {
+        botData.userWatchMap.set(guildId, members);
+    }
+
+    export function getGuildWatchList(guildId: string) {
+        botData.userWatchMap.get(guildId);
+    }
+
+    export function removeGuildWatchList(guildId: string) {
+        botData.userWatchMap.delete(guildId);
+    }
 }
 
 export class Bot {
-    botData: BotData = { activeConnections: new Map() };
-
     constructor(client: Discord.Client, prefix: string) {
         this.init(client, prefix);
     }
 
     async init(client: Discord.Client, prefix: string) {
-        admin
-            .firestore()
-            .collection('watchedUsers')
-            .onSnapshot((document) => {});
+        const eventHandler = new EventHandler();
+        BotDataStorage.setClient(client);
 
         client.on('message', async (message) => {
             if (message.author.bot) return;
@@ -32,97 +138,8 @@ export class Bot {
             const args = commandBody.split(/ +/);
             const command = args.shift()?.toLowerCase();
 
-            if (command === 'na') {
-                message.reply('WAS IST DENN HIER LOS?');
-            } else if (command === 'spy') {
-                const connectedChannel = message.member?.voice.channel;
-                const connection = await connectedChannel?.join();
-
-                if (connection && message.guild) {
-                    this.botData.activeConnections.set(
-                        message.guild?.id,
-                        connection
-                    );
-
-                    new FirebaseSync(client, message.guild.id, (members) => {
-                        console.log('Updating member list');
-
-                        connectedChannel?.members.forEach((member) => {
-                            if (!members.map((m) => m.id).includes(member.id))
-                                return;
-
-                            this._watchUser(member, message.guild!.id);
-                        });
-                    });
-
-                    message.reply('Sure thing, bud!');
-                }
-            } else if (command === 'kill') {
-                if (message.guild != null) {
-                    this.botData.activeConnections
-                        .get(message.guild.id)
-                        ?.disconnect();
-
-                    this.botData.activeConnections.delete(message.guild.id);
-                    message.reply('C ya!');
-                }
-            } else if (command === 'person_add') {
-                const userId = message.mentions.users.first()?.id;
-                const guildId = message.guild?.id;
-
-                if (userId && guildId) {
-                    admin
-                        .firestore()
-                        .collection('watchedUsers')
-                        .doc(userId)
-                        .set({
-                            guildId,
-                        });
-                } else {
-                    message.reply(
-                        'You need to mention the person you want to add to the watch list.'
-                    );
-                }
-            } else if (command === 'person_get') {
-                const guildId = message.guild?.id;
-
-                if (guildId) {
-                    const documents = await admin
-                        .firestore()
-                        .collection('watchedUsers')
-                        .where('guildId', '==', guildId)
-                        .get();
-
-                    const userNames: string[] = [];
-
-                    for (let i = 0; i < documents.size; i++) {
-                        if (documents.docs[i].exists) {
-                            userNames.push(
-                                (
-                                    await message.guild?.members.fetch(
-                                        documents.docs[i].id
-                                    )
-                                )?.displayName ?? ''
-                            );
-                        }
-                    }
-
-                    message.reply(
-                        `Those individuals are on the watch list right now: ${userNames.join(
-                            ', '
-                        )}`
-                    );
-                }
-            } else if (command === 'person_remove') {
-                const userId = message.mentions.users.first()?.id;
-
-                if (userId) {
-                    admin
-                        .firestore()
-                        .collection('watchedUsers')
-                        .doc(userId)
-                        .delete();
-                }
+            if (command) {
+                eventHandler.dispatch(command, message);
             }
         });
 
@@ -135,20 +152,5 @@ export class Bot {
         });
 
         client.login(config.BOT_TOKEN);
-    }
-
-    _watchUser(member: Discord.GuildMember, guildId: string) {
-        const audio = this.botData.activeConnections
-            .get(guildId)
-            ?.receiver.createStream(member.id, {
-                mode: 'pcm',
-                end: 'manual',
-            });
-
-        if (audio) {
-            new Watcher(audio, 10000, async () => {
-                await member.voice.kick();
-            });
-        }
     }
 }
